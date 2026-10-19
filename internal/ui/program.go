@@ -544,6 +544,12 @@ func (m harness) updateApproval(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// If the modal was up, layout needs to revert from modal-size to the
 	// normal panel/viewport split before the next render.
 	m.layout()
+	// The spinner's tick chain dies while we wait on y/n (the TickMsg
+	// handler only re-arms in stateRunning), so restart it or it sits
+	// frozen on one frame for the rest of the turn.
+	if m.state == stateRunning || subagent.Background.Busy() {
+		return m, m.spinner.Tick
+	}
 	return m, nil
 }
 
