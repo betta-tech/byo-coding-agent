@@ -35,6 +35,7 @@ func (BashTool) Execute(ctx context.Context, rawInput string) (string, bool) {
 		return fmt.Sprintf("invalid tool input: %v", err), true
 	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", in.Command)
+	cmd.Dir = WorkDir(ctx) // "" = process cwd
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Sprintf("%s\n[exit error: %v]", out, err), true

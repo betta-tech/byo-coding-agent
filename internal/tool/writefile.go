@@ -31,7 +31,7 @@ func (WriteFileTool) Definition() api.ToolDef {
 	}
 }
 
-func (WriteFileTool) Execute(_ context.Context, rawInput string) (string, bool) {
+func (WriteFileTool) Execute(ctx context.Context, rawInput string) (string, bool) {
 	var in struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
@@ -39,7 +39,11 @@ func (WriteFileTool) Execute(_ context.Context, rawInput string) (string, bool) 
 	if err := json.Unmarshal([]byte(rawInput), &in); err != nil {
 		return fmt.Sprintf("invalid tool input: %v", err), true
 	}
-	if err := os.WriteFile(in.Path, []byte(in.Content), 0644); err != nil {
+	path, err := ResolvePath(ctx, in.Path)
+	if err != nil {
+		return err.Error(), true
+	}
+	if err := os.WriteFile(path, []byte(in.Content), 0644); err != nil {
 		return err.Error(), true
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(in.Content), in.Path), false

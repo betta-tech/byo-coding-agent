@@ -12,6 +12,9 @@ mcp.json
 # or other context worth keeping local.
 .harness/
 
+# Background agents' git worktrees (one checkout per agent).
+.worktrees/
+
 # Generated static site (cmd/sitegen output). CI rebuilds and deploys it.
 site/
 

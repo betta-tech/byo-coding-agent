@@ -103,16 +103,23 @@ type harness struct {
 	input     textinput.Model
 	spinner   spinner.Model
 
-	state          modelState
-	approvalPrompt string
-	approvalDetail string // optional diff/payload shown in the approval modal
-	approvalReply  chan bool
-	followBottom   bool // auto-scroll viewport to bottom on new content
+	state            modelState
+	preApprovalState modelState // restored after y/n: background agents can ask while the root is idle
+	approvalPrompt   string
+	approvalDetail   string // optional diff/payload shown in the approval modal
+	approvalReply    chan bool
+	followBottom     bool // auto-scroll viewport to bottom on new content
 
 	// debug-panel interaction state
 	debugFocus    bool      // Tab moves focus between input and debug panel
 	debugMode     debugMode // list (overview) or detail (one event's payload)
 	debugSelected uint64    // ID of the currently-selected event
+
+	// agents-sidebar interaction state (see agents.go)
+	agentsFocus    bool
+	agentsSelected int
+	agentDetail    bool           // log modal for the selected agent is open
+	agentView      viewport.Model // hosts that log
 
 	// banner shine animation state. bannerEnd is the byte offset in output
 	// where the banner ends, so each tick can swap the banner without
@@ -170,6 +177,7 @@ func newHarness(runner AgentRunner, usageFunc UsageFunc, banner string) harness 
 		input:        ti,
 		viewport:     vp,
 		debugView:    dv,
+		agentView:    viewport.New(80, 20),
 		spinner:      sp,
 		followBottom: true,
 		// shineCol starts off-screen left so the very first frame shows
@@ -289,6 +297,25 @@ func (m harness) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case FleetRefreshMsg:
+		// The first spawn makes the sidebar appear, which narrows the
+		// conversation — re-wrap it when that happens.
+		prevW := m.viewport.Width
+		m.layout()
+		if m.viewport.Width != prevW {
+			m.setConversationContent()
+			if m.followBottom {
+				m.viewport.GotoBottom()
+			}
+		}
+		if m.agentDetail {
+			m.refreshAgentView(false)
+		}
+		if subagent.Background.Busy() {
+			return m, m.spinner.Tick // stale ticks are dropped by the spinner, so extra kicks are free
+		}
+		return m, nil
+
 	case MCPStatusMsg:
 		switch msg.Status {
 		case mcp.ProgressBegin:
@@ -318,6 +345,11 @@ func (m harness) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
+		if m.state != stateAwaitingApproval {
+			if mm, ok := m.mouseAgents(msg); ok {
+				return mm, nil
+			}
+		}
 		// Mouse only matters when the bottom panel is on screen. The modal
 		// hides it; in detail mode we ignore clicks entirely.
 		if !debug.Enabled() || m.debugMode == debugDetail {
@@ -332,11 +364,13 @@ func (m harness) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == stateAwaitingApproval {
 			return m.updateApproval(msg)
 		}
-		// Tab toggles focus between the input box and the debug panel,
-		// regardless of which is currently active. Only meaningful when the
-		// panel is visible.
-		if msg.Type == tea.KeyTab && debug.Enabled() {
-			return m.toggleDebugFocus(), nil
+		// Tab cycles focus: input → agents sidebar → debug panel → input,
+		// skipping whichever panels aren't on screen.
+		if msg.Type == tea.KeyTab && (debug.Enabled() || m.agentsVisible()) {
+			return m.cycleFocus(), nil
+		}
+		if m.agentsFocus {
+			return m.updateAgentsFocus(msg)
 		}
 		if m.debugFocus {
 			return m.updateDebugFocus(msg)
@@ -352,7 +386,13 @@ func (m harness) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case agentDoneMsg:
-		m.state = stateIdle
+		if m.state == stateAwaitingApproval {
+			// A background agent's question is on screen; go idle once
+			// the user answers it instead of hiding it now.
+			m.preApprovalState = stateIdle
+		} else {
+			m.state = stateIdle
+		}
 		if msg.err != nil {
 			m.output.WriteString(Dimmed(fmt.Sprintf("error: %v", msg.err)) + "\n")
 			m.setConversationContent()
@@ -363,6 +403,7 @@ func (m harness) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ApprovalRequest:
+		m.preApprovalState = m.state
 		m.state = stateAwaitingApproval
 		m.approvalPrompt = msg.Prompt
 		m.approvalDetail = msg.Detail
@@ -408,7 +449,7 @@ func (m harness) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Keep ticking while either the agent is mid-call or MCP is still
 		// connecting in the background. Otherwise the spinner pauses on
 		// its current frame.
-		if m.state != stateRunning && !m.mcpLoading {
+		if m.state != stateRunning && !m.mcpLoading && !subagent.Background.Busy() {
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -499,10 +540,16 @@ func (m harness) updateApproval(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	m.approvalPrompt = ""
 	m.approvalDetail = ""
-	m.state = stateRunning
+	m.state = m.preApprovalState
 	// If the modal was up, layout needs to revert from modal-size to the
 	// normal panel/viewport split before the next render.
 	m.layout()
+	// The spinner's tick chain dies while we wait on y/n (the TickMsg
+	// handler only re-arms in stateRunning), so restart it or it sits
+	// frozen on one frame for the rest of the turn.
+	if m.state == stateRunning || subagent.Background.Busy() {
+		return m, m.spinner.Tick
+	}
 	return m, nil
 }
 
@@ -535,9 +582,16 @@ func (m *harness) layout() {
 		debugH = debugPanelHeight
 	}
 	m.viewport.Width = m.width
+	if m.agentsVisible() {
+		m.viewport.Width = m.width - sidebarWidth
+	}
 	m.viewport.Height = max(m.height-inputHeight-debugH, 3)
 	m.debugView.Width = max(m.width-2, 20)
 	m.debugView.Height = max(debugPanelHeight-2, 1)
+	// The agent view fills the conversation's slot: minus 1-col padding
+	// each side, minus header, task and separator rows.
+	m.agentView.Width = max(m.viewport.Width-2, 20)
+	m.agentView.Height = max(m.viewport.Height-3, 1)
 }
 
 // inModal reports whether the current state should render a centered
@@ -642,6 +696,27 @@ func (m *harness) renderDebugDetail() {
 	// payload.
 	m.debugView.SetContent(HighlightPayload(body, m.debugView.Width))
 	m.debugView.GotoTop()
+}
+
+// cycleFocus moves focus to the next visible pane.
+func (m harness) cycleFocus() tea.Model {
+	switch {
+	case m.agentsFocus:
+		m.agentsFocus, m.agentDetail = false, false
+		m.layout()
+		if debug.Enabled() {
+			return m.toggleDebugFocus()
+		}
+		m.input.Focus()
+	case m.debugFocus:
+		return m.toggleDebugFocus()
+	case m.agentsVisible():
+		m.agentsFocus = true
+		m.input.Blur()
+	default:
+		return m.toggleDebugFocus()
+	}
+	return m
 }
 
 // toggleDebugFocus flips focus between the input box and the debug panel.
@@ -946,7 +1021,14 @@ func (m harness) View() string {
 	if m.debugMode == debugDetail && debug.Enabled() {
 		return m.viewDebugModal()
 	}
-	parts := []string{m.viewport.View()}
+	top := m.viewport.View()
+	if m.agentDetail {
+		top = m.viewAgentPane()
+	}
+	if m.agentsVisible() {
+		top = lipgloss.JoinHorizontal(lipgloss.Top, top, m.viewSidebar(m.viewport.Height))
+	}
+	parts := []string{top}
 	if debug.Enabled() {
 		boxStyle := debugBoxStyle
 		if m.debugFocus {
@@ -1091,7 +1173,7 @@ func (m harness) inputArea() string {
 	}
 
 	inputBorder := lipgloss.Color("36")
-	if m.debugFocus {
+	if m.debugFocus || m.agentsFocus {
 		// Dim the input border when the debug panel has focus so it's
 		// obvious where keystrokes are going.
 		inputBorder = lipgloss.Color("240")
@@ -1153,6 +1235,15 @@ func (m harness) hintText() string {
 			return "  debug · esc: back · pgup/pgdn: scroll · tab: input · ctrl-d: exit"
 		}
 		return "  debug · ↑/↓ home/end: select · enter: detail · esc/tab: input · ctrl-d: exit"
+	}
+	if m.agentDetail {
+		return "  agent view · ↑/↓: switch agent · pgup/pgdn/wheel: scroll · m: merge · x: discard · esc: back · tab: input"
+	}
+	if m.agentsFocus {
+		return "  agents · ↑/↓: select · enter/click: view · m: merge · x: discard · esc/tab: input · ctrl-d: exit"
+	}
+	if m.agentsVisible() {
+		return "  enter: send · tab or click: agents panel · pgup/pgdn: scroll · ctrl-d: exit"
 	}
 	if debug.Enabled() {
 		return "  enter: send · tab: debug panel · pgup/pgdn: scroll · ctrl-d: exit"

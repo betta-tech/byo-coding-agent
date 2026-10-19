@@ -27,14 +27,18 @@ func (ReadFileTool) Definition() api.ToolDef {
 	}
 }
 
-func (ReadFileTool) Execute(_ context.Context, rawInput string) (string, bool) {
+func (ReadFileTool) Execute(ctx context.Context, rawInput string) (string, bool) {
 	var in struct {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal([]byte(rawInput), &in); err != nil {
 		return fmt.Sprintf("invalid tool input: %v", err), true
 	}
-	data, err := os.ReadFile(in.Path)
+	path, err := ResolvePath(ctx, in.Path)
+	if err != nil {
+		return err.Error(), true
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err.Error(), true
 	}
