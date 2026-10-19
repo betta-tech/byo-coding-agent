@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/betta-tech/byo-coding-agent/internal/api"
 	"github.com/betta-tech/byo-coding-agent/internal/compact"
@@ -47,6 +48,13 @@ func init() {
 		usage:       "/debug [on|off|clear|ls|show [id]]",
 		run:         cmdDebug,
 	}
+	commands["agents"] = command{
+		description: "list background agents, or print one agent's log",
+		usage:       "/agents [log <name>]",
+		run:         cmdAgents,
+	}
+	commands["merge"] = command{description: "merge a finished background agent's branch", usage: "/merge <name>", run: cmdMerge}
+	commands["discard"] = command{description: "stop a background agent and delete its worktree", usage: "/discard <name>", run: cmdDiscard}
 	commands["exit"] = command{description: "exit the harness", run: cmdExit}
 }
 
@@ -413,4 +421,45 @@ func cmdDebugShow(idStr string) {
 
 func cmdExit(_ string) {
 	os.Exit(0)
+}
+
+func cmdAgents(args string) {
+	if name, ok := strings.CutPrefix(args, "log "); ok {
+		log := subagent.Background.Log(strings.TrimSpace(name))
+		if log == "" {
+			fmt.Println(ui.Dimmed("no log for that agent"))
+			return
+		}
+		fmt.Print(log)
+		return
+	}
+	agents := subagent.Background.Snapshot()
+	if len(agents) == 0 {
+		fmt.Println(ui.Dimmed("no background agents yet — ask for parallel work and the model will spawn some"))
+		return
+	}
+	for _, a := range agents {
+		fmt.Printf("  %s  %-9s %s  %s  %s\n",
+			ui.Cyan(fmt.Sprintf("%-14s", a.Name)),
+			a.State,
+			ui.Dimmed(fmt.Sprintf("+%d −%d", a.Added, a.Removed)),
+			ui.Dimmed(a.Elapsed().Round(time.Second).String()),
+			ui.Dimmed(a.Branch))
+	}
+}
+
+func cmdMerge(name string) {
+	if name == "" {
+		fmt.Println("usage: /merge <name>")
+		return
+	}
+	ui.MergeAgent(name)
+}
+
+func cmdDiscard(name string) {
+	if name == "" {
+		fmt.Println("usage: /discard <name>")
+		return
+	}
+	ui.DiscardAgent(name)
 }

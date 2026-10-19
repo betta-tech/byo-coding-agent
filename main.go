@@ -45,6 +45,8 @@ Tool guidance:
 
 For acting on the filesystem (creating, editing, running things), use bash, read_file, and write_file directly. Writes are mediated by a diff approval modal, so propose changes naturally — the user reviews each one.
 
+For INDEPENDENT, PARALLELIZABLE WORK — "try three approaches", "do X and Y at the same time", long tasks the user shouldn't wait on — use spawn_agent, once per agent, in a single turn. Each runs in its own git worktree and shows up in the agents sidebar; the user merges what they like with /merge. Mention that once so they know where to look.
+
 For READ-ONLY INVESTIGATION you SHOULD call delegate_research rather than reading files yourself. This includes questions like:
 - "where is X defined?"
 - "what fields does Y have?"
@@ -168,6 +170,13 @@ func main() {
 		if runCommand(input) {
 			return nil
 		}
+		// Background agents that finished since the last turn report in
+		// here. Prepending to the user message (rather than waking the
+		// agent on its own) keeps the root agent strictly turn-based.
+		if notes := subagent.Background.DrainNotes(); len(notes) > 0 {
+			input = "<background-agent-reports>\n" + strings.Join(notes, "\n\n") +
+				"\n</background-agent-reports>\n\n" + input
+		}
 		_, err := rootAgent.Send(ctx, input)
 		return err
 	}
@@ -227,10 +236,27 @@ func main() {
 	// channel. The program's Update flips into stateAwaitingApproval, the
 	// user picks, and we resume. detail is optional long-form content
 	// (e.g. a diff for write_file calls) shown in a modal.
+	//
+	// Background agents ask too, from their own goroutines, and the UI
+	// can only show one question at a time. The mutex queues them.
+	var confirmMu sync.Mutex
 	rootAgent.Confirm = func(prompt, detail string) bool {
+		confirmMu.Lock()
+		defer confirmMu.Unlock()
 		reply := make(chan bool, 1)
 		program.Send(ui.ApprovalRequest{Prompt: prompt, Detail: detail, Reply: reply})
 		return <-reply
+	}
+
+	subagent.Background.Confirm = rootAgent.Confirm
+	subagent.Background.OnChange = func() { program.Send(ui.FleetRefreshMsg{}) }
+	subagent.Background.OnFinish = func(s subagent.Status) {
+		verdict := "finished"
+		if s.State == subagent.StateFailed {
+			verdict = "failed"
+		}
+		fmt.Println(ui.Dimmed(fmt.Sprintf("● background agent %s %s (+%d −%d) — /merge %s or /discard %s",
+			s.Name, verdict, s.Added, s.Removed, s.Name, s.Name)))
 	}
 
 	// Redirect stdout into the program. Every existing fmt.Println in the
@@ -427,4 +453,10 @@ func registerSubagents(llm provider.Provider) {
 	for _, sa := range subagent.Default.All() {
 		tool.Default.Register(&DelegateTool{Subagent: sa})
 	}
+
+	// Background agents get the hands-on tools but not delegate_* or
+	// spawn_agent: no agents spawning agents.
+	subagent.Background.Provider = llm
+	subagent.Background.Tools = tool.Default.Subset("bash", "read_file", "write_file")
+	tool.Default.Register(SpawnTool{})
 }
